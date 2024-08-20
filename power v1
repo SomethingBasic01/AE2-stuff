@@ -1,0 +1,75 @@
+local component = require("component")
+local event = require("event")
+local term = require("term")
+local gpu = component.gpu
+local meController = component.me_controller -- Assuming you're using me_controller
+
+local alertThreshold = 20 -- percentage below which to trigger an alert
+
+-- Function to draw a horizontal bar
+local function drawBar(x, y, length, percentage, color)
+    gpu.setForeground(color)
+    local filledLength = math.floor((percentage / 100) * length)
+    gpu.set(x, y, string.rep("█", filledLength) .. string.rep(" ", length - filledLength))
+    gpu.setForeground(0xFFFFFF) -- Reset color to white
+end
+
+local function monitorEnergy()
+    local screenWidth, screenHeight = gpu.getResolution()
+    local barLength = screenWidth - 2
+
+    while true do
+        local storedEnergy = meController.getStoredPower()
+        local maxEnergy = meController.getMaxStoredPower()
+
+        -- Debugging output
+        print("Debug: storedEnergy =", storedEnergy, "Type:", type(storedEnergy))
+        print("Debug: maxEnergy =", maxEnergy, "Type:", type(maxEnergy))
+
+        -- Handle cases where storedEnergy or maxEnergy might be nil or not a number
+        if type(storedEnergy) ~= "number" or type(maxEnergy) ~= "number" or maxEnergy == 0 then
+            term.clear()
+            gpu.setForeground(0xFF0000) -- Red color
+            term.setCursor(2, 2)
+            print("ERROR: Invalid energy data!")
+            print("storedEnergy =", storedEnergy, "Type:", type(storedEnergy))
+            print("maxEnergy =", maxEnergy, "Type:", type(maxEnergy))
+            gpu.setForeground(0xFFFFFF) -- Reset color to white
+        else
+            local energyPercentage = (storedEnergy / maxEnergy) * 100
+
+            term.clear()
+
+            -- Display the header
+            gpu.setForeground(0x00FF00) -- Green color
+            term.setCursor(2, 2)
+            print("AE2 Energy Monitor")
+            gpu.setForeground(0xFFFFFF) -- Reset color to white
+            print("----------------------------")
+
+            -- Display energy status
+            term.setCursor(2, 4)
+            print(string.format("Stored Energy: %d RF", math.floor(storedEnergy)))
+            term.setCursor(2, 5)
+            print(string.format("Max Energy: %d RF", math.floor(maxEnergy)))
+
+            -- Draw the energy usage bar
+            term.setCursor(2, 7)
+            print(string.format("Energy Usage: %.2f%%", energyPercentage))
+            drawBar(2, 8, barLength, energyPercentage, 0x00FF00) -- Green bar
+
+            -- Check if energy is below the threshold and display an alert if necessary
+            if energyPercentage < alertThreshold then
+                gpu.setForeground(0xFF0000) -- Red color
+                term.setCursor(2, 10)
+                print("ALERT: Energy levels critically low!")
+                gpu.setForeground(0xFFFFFF) -- Reset color to white
+            end
+        end
+
+        os.sleep(5)
+    end
+end
+
+-- Start monitoring
+monitorEnergy()
