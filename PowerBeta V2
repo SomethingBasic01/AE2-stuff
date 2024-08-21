@@ -1,0 +1,420 @@
+local component = require("component")
+local event = require("event")
+local term = require("term")
+local gpu = component.gpu
+local filesystem = require("filesystem")
+local sides = require("sides")
+local serialization = require("serialization")
+
+local meControllers = {} -- Table to hold multiple ME Controllers
+local logFile = "/home/energy_log.txt" -- File path for logging
+local history = {} -- Table to hold energy history for graphing
+local historyLimit = 100 -- Limit for how many history points to store
+local languages = {["en"] = "English", ["es"] = "Español"} -- Multi-language support
+local currentLanguage = "en"
+local langStrings = {} -- Table to hold language strings
+local settings = {
+    autoPowerManagement = false,
+    alertThresholdLow = 20,   -- Default alert threshold
+    alertThresholdCritical = 10, -- Critical alert threshold
+    powerOnThreshold = 20, -- Default power-on threshold
+    powerOffThreshold = 80 -- Default power-off threshold
+}
+
+local passwordFile = "/home/.password"
+
+local function hashPassword(password)
+    local hash = 0
+    for i = 1, #password do
+        hash = (hash + password:byte(i)) % 100000
+    end
+    return tostring(hash)
+end
+
+local function setPassword()
+    term.clear()
+    term.setCursor(2, 2)
+    term.write("Create a new password: ")
+    local newPassword = term.read(nil, nil, nil, "*")
+    term.setCursor(2, 4)
+    term.write("Confirm password: ")
+    local confirmPassword = term.read(nil, nil, nil, "*")
+    
+    if newPassword == confirmPassword then
+        local file = io.open(passwordFile, "w")
+        file:write(hashPassword(newPassword))
+        file:close()
+        print("Password set successfully.")
+    else
+        print("Passwords do not match. Please restart the program.")
+        os.exit()
+    end
+end
+
+local function checkPassword()
+    if not filesystem.exists(passwordFile) then
+        setPassword()
+    else
+        local file = io.open(passwordFile, "r")
+        local savedHash = file:read("*all")
+        file:close()
+
+        term.setCursor(2, 2)
+        term.write("Enter password: ")
+        local input = term.read(nil, nil, nil, "*")
+        
+        if hashPassword(input) ~= savedHash then
+            print("Access Denied")
+            os.exit()
+        else
+            print("Access Granted")
+        end
+    end
+end
+
+langStrings["en"] = {
+    monitorTitle = "AE2 Energy Monitor",
+    storedEnergy = "Stored Energy: %d RF",
+    maxEnergy = "Max Energy: %d RF",
+    energyUsage = "Energy Usage: %.2f%%",
+    alertLow = "ALERT: Energy levels critically low!",
+    alertCritical = "CRITICAL ALERT: Energy levels critically low!",
+    errorInvalid = "ERROR: Invalid energy data!",
+    configMenu = "Config Menu",
+    togglePower = "Toggle Auto Power Management",
+    setAlert = "Set Alert Levels",
+    setPowerOn = "Set Power-On Threshold",
+    setPowerOff = "Set Power-Off Threshold",
+    back = "Back",
+    explainText = "Auto Power Management automatically turns on or off generators based on energy levels.",
+    efficiencyReport = "Generate Efficiency Report",
+    addMEController = "Add ME Controller",
+    userAuth = "User Authentication"
+}
+
+langStrings["es"] = {
+    monitorTitle = "Monitor de Energía AE2",
+    storedEnergy = "Energía Almacenada: %d RF",
+    maxEnergy = "Máxima Energía: %d RF",
+    energyUsage = "Uso de Energía: %.2f%%",
+    alertLow = "¡ALERTA: Niveles de energía críticamente bajos!",
+    alertCritical = "¡ALERTA CRÍTICA: Niveles de energía críticamente bajos!",
+    errorInvalid = "ERROR: Datos de energía inválidos!",
+    configMenu = "Menú de Configuración",
+    togglePower = "Alternar Gestión Automática de Energía",
+    setAlert = "Establecer Niveles de Alerta",
+    setPowerOn = "Establecer Umbral de Encendido",
+    setPowerOff = "Establecer Umbral de Apagado",
+    back = "Volver",
+    explainText = "La Gestión Automática de Energía enciende o apaga generadores automáticamente según los niveles de energía.",
+    efficiencyReport = "Generar Informe de Eficiencia",
+    addMEController = "Agregar Controlador ME",
+    userAuth = "Autenticación de Usuario"
+}
+
+local function loadLanguage()
+    return langStrings[currentLanguage]
+end
+
+local function drawBar(x, y, length, percentage, color)
+    gpu.setForeground(color)
+    local filledLength = math.floor((percentage / 100) * length)
+    gpu.set(x, y, string.rep("█", filledLength) .. string.rep(" ", length - filledLength))
+    gpu.setForeground(0xFFFFFF) -- Reset color to white
+end
+
+local function logEnergyData(storedEnergy, maxEnergy)
+    if not filesystem.exists(logFile) then
+        local file = io.open(logFile, "w")
+        file:close()
+    end
+    local file = io.open(logFile, "a")
+    file:write(os.date("%Y-%m-%d %H:%M:%S") .. " - Stored: " .. storedEnergy .. " RF, Max: " .. maxEnergy .. " RF\n")
+    file:close()
+end
+
+local function updateHistory(energyPercentage)
+    table.insert(history, energyPercentage)
+    if #history > historyLimit then
+        table.remove(history, 1)
+    end
+end
+
+local function drawGraph(history)
+    local graphHeight = 10
+    local graphYStart = 14 -- Move the graph down to prevent label cutoff
+    local maxVal = math.max(table.unpack(history))
+    
+    -- Label the graph
+    term.setCursor(2, graphYStart - 2)
+    term.write("Energy (%)")
+    for y = graphHeight, 1, -1 do
+        term.setCursor(1, graphYStart + graphHeight - y)
+        term.write(string.format("%3d", math.floor((y / graphHeight) * 100)))
+        term.setCursor(5, graphYStart + graphHeight - y)
+        for _, val in ipairs(history) do
+            if val / maxVal * graphHeight >= y then
+                term.write("#")
+            else
+                term.write(" ")
+            end
+        end
+    end
+
+    -- X-axis label
+    term.setCursor(5, graphYStart + graphHeight + 1)
+    term.write("Time")
+end
+
+local function forecastEnergyML(history)
+    local n = #history
+    if n < 2 then return history[#history] end
+
+    local sumX, sumY, sumXY, sumX2 = 0, 0, 0, 0
+    for i = 1, n do
+        sumX = sumX + i
+        sumY = sumY + history[i]
+        sumXY = sumXY + i * history[i]
+        sumX2 = sumX2 + i * i
+    end
+
+    local slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX)
+    local intercept = (sumY - slope * sumX) / n
+
+    return intercept + slope * (n + 10)
+end
+
+local function managePowerGenerator(generatorSide, energyPercentage)
+    if energyPercentage < settings.powerOnThreshold then
+        component.redstone.setOutput(generatorSide, 15) -- Turn on generator
+    elseif energyPercentage > settings.powerOffThreshold then
+        component.redstone.setOutput(generatorSide, 0) -- Turn off generator
+    end
+end
+
+local function drawButton(x, y, text)
+    gpu.setForeground(0x0000FF)
+    term.setCursor(x, y)
+    print("[" .. text .. "]")
+    gpu.setForeground(0xFFFFFF) -- Reset color to white
+end
+
+local function readUserInput(prompt)
+    term.setCursor(2, 2)
+    term.clearLine()
+    term.write(prompt)
+    local input = term.read()
+    return tonumber(input)
+end
+
+local function addMEController()
+    print("Enter the address of the ME Controller:")
+    local address = term.read()
+    table.insert(meControllers, component.proxy(address))
+end
+
+local function generateEfficiencyReport()
+    local file = io.open("/home/efficiency_report.txt", "w")
+    file:write("Efficiency Report\n")
+    for i, meController in ipairs(meControllers) do
+        local storedEnergy = meController.getStoredPower()
+        local maxEnergy = meController.getMaxStoredPower()
+        file:write("Controller " .. i .. ": " .. storedEnergy / maxEnergy * 100 .. "% efficiency\n")
+    end
+    file:close()
+    print("Efficiency report generated.")
+end
+
+local function setCustomAlertLevel()
+    print("Set custom alert levels (low/critical): ")
+    local low = tonumber(term.read())
+    local critical = tonumber(term.read())
+    if low and critical then
+        settings.alertThresholdLow = low
+        settings.alertThresholdCritical = critical
+        print("Alert levels updated.")
+    else
+        print("Invalid input. Alert levels not updated.")
+    end
+end
+
+local function adjustThresholds()
+    local average = forecastEnergyML(history)
+    settings.powerOnThreshold = math.max(10, average - 10)
+    settings.powerOffThreshold = math.min(90, average + 10)
+end
+
+local function exportData()
+    local file = io.open("/home/energy_data.csv", "w")
+    file:write("Timestamp,StoredEnergy,MaxEnergy\n")
+    for i = 1, #history do
+        file:write(os.date() .. "," .. history[i] .. "," .. maxEnergy .. "\n")
+    end
+    file:close()
+end
+
+local function backupSettings()
+    local file = io.open("/home/settings_backup.lua", "w")
+    file:write(serialization.serialize(settings))
+    file:close()
+    print("Settings backed up.")
+end
+
+local function restoreSettings()
+    if filesystem.exists("/home/settings_backup.lua") then
+        local file = io.open("/home/settings_backup.lua", "r")
+        settings = serialization.unserialize(file:read("*all"))
+        file:close()
+        print("Settings restored.")
+    end
+end
+
+local function openConfigMenu()
+    local lang = loadLanguage()
+    term.clear()
+    gpu.setForeground(0x00FF00)
+    print(lang.configMenu)
+    gpu.setForeground(0xFFFFFF)
+    print("----------------------------")
+    drawButton(2, 3, lang.togglePower)
+    drawButton(2, 5, lang.setAlert)
+    drawButton(2, 7, lang.setPowerOn)
+    drawButton(2, 9, lang.setPowerOff)
+    drawButton(2, 11, lang.addMEController)
+    drawButton(2, 13, lang.efficiencyReport)
+    drawButton(2, 15, lang.back)
+    
+    local evt, _, _, y = event.pull("touch")
+    if y == 3 then
+        settings.autoPowerManagement = not settings.autoPowerManagement
+        term.clear()
+        if settings.autoPowerManagement then
+            print("Auto Power Management enabled.")
+        else
+            print("Auto Power Management disabled.")
+        end
+        os.sleep(2)
+    elseif y == 5 then
+        setCustomAlertLevel()
+    elseif y == 7 then
+        local newPowerOnThreshold = readUserInput("Enter new power-on threshold (%): ")
+        if newPowerOnThreshold then
+            settings.powerOnThreshold = newPowerOnThreshold
+        end
+    elseif y == 9 then
+        local newPowerOffThreshold = readUserInput("Enter new power-off threshold (%): ")
+        if newPowerOffThreshold then
+            settings.powerOffThreshold = newPowerOffThreshold
+        end
+    elseif y == 11 then
+        addMEController()
+    elseif y == 13 then
+        generateEfficiencyReport()
+    elseif y == 15 then
+        return true -- This signals that the user wants to exit the config menu
+    end
+
+    return false -- Continue in the config menu
+end
+
+local function monitorEnergy()
+    checkPassword() -- User authentication at start
+    restoreSettings() -- Restore previous settings if available
+
+    local screenWidth, screenHeight = gpu.getResolution()
+    local barLength = screenWidth - 2
+    local lang = loadLanguage()
+
+    local running = true -- Flag to control the main screen update loop
+
+    while running do
+        term.clear()
+        local y = 2
+
+        gpu.setForeground(0x00FF00) -- Green color
+        term.setCursor(2, y)
+        print(lang.monitorTitle)
+        gpu.setForeground(0xFFFFFF) -- Reset color to white
+        y = y + 1
+        print("----------------------------")
+        y = y + 2
+
+        for i, meController in ipairs(meControllers) do
+            -- Read current energy values from the ME Controller
+            local storedEnergy = meController.getStoredPower()
+            local maxEnergy = meController.getMaxStoredPower()
+
+            if type(storedEnergy) ~= "number" or type(maxEnergy) ~= "number" or maxEnergy == 0 then
+                term.setCursor(2, y)
+                gpu.setForeground(0xFF0000) -- Red color
+                print(lang.errorInvalid)
+                y = y + 2
+                gpu.setForeground(0xFFFFFF) -- Reset color to white
+            else
+                local energyPercentage = (storedEnergy / maxEnergy) * 100
+                term.setCursor(2, y)
+                print(string.format(lang.storedEnergy, math.floor(storedEnergy)))
+                y = y + 1
+                term.setCursor(2, y)
+                print(string.format(lang.maxEnergy, math.floor(maxEnergy)))
+                y = y + 1
+
+                -- Draw the energy usage bar
+                term.setCursor(2, y)
+                print(string.format(lang.energyUsage, energyPercentage))
+                drawBar(2, y + 1, barLength, energyPercentage, 0x00FF00) -- Green bar
+
+                -- Log the energy data
+                logEnergyData(storedEnergy, maxEnergy)
+                updateHistory(energyPercentage)
+
+                -- Display the forecast using machine learning
+                y = y + 3
+                local forecast = forecastEnergyML(history)
+                term.setCursor(2, y)
+                print("Forecast in 10 cycles: " .. string.format("%.2f", forecast) .. "%")
+
+                -- Draw the graph of energy history
+                drawGraph(history)
+
+                -- Auto Power Management logic
+                if settings.autoPowerManagement then
+                    adjustThresholds() -- Adjust thresholds based on usage patterns
+                    managePowerGenerator(sides.bottom, energyPercentage) -- Example managing a generator on the bottom side
+                end
+
+                -- Check if energy is below the custom thresholds and display alerts
+                if energyPercentage < settings.alertThresholdCritical then
+                    gpu.setForeground(0xFF0000) -- Red color
+                    term.setCursor(2, y + 2)
+                    print(lang.alertCritical)
+                    gpu.setForeground(0xFFFFFF) -- Reset color to white
+                elseif energyPercentage < settings.alertThresholdLow then
+                    gpu.setForeground(0xFFAA00) -- Orange color
+                    term.setCursor(2, y + 2)
+                    print(lang.alertLow)
+                    gpu.setForeground(0xFFFFFF) -- Reset color to white
+                end
+
+                y = y + 3
+            end
+        end
+
+        drawButton(2, y, "Config Menu")
+
+        -- Handle user input events in parallel with screen updates
+        local evt, _, _, btnY = event.pull(1) -- 1 second timeout for event.pull
+        if evt == "touch" then
+            if btnY == y then
+                running = not openConfigMenu() -- Pause updates when entering config menu
+            end
+        end
+    end
+
+    -- If we exit the config menu, the loop restarts updating the screen
+    monitorEnergy()
+end
+
+-- Start monitoring
+meControllers[1] = component.me_controller -- Add your ME controllers here
+monitorEnergy()
